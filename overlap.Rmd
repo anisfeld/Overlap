@@ -1,0 +1,340 @@
+---
+title: "Overlapping Areas"
+author: "Ari Anisfeld"
+date: "12/18/2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+library(sf)
+library(tidyverse)
+library(haven)
+# Note I'm using a development version of ggplot2 that includes geom_sf() 
+# install.packages(devtools)
+# devtools::install_github("tidyverse/ggplot2")
+# library(ggplot2)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+# Helper functions for making maps
+st_erase <- function(x, y) st_difference(x, st_union(st_combine(y)))
+# removes areas that become sliver polygons
+clean_slivers <- function(g1, g2, buff=-.001, portion_overlap=.04, erase=TRUE){
+  g1 <- mutate(g1, g_area=st_area(geometry))
+  slivers <- st_intersection(st_buffer(g1, buff), g2)
+  slivers <- mutate(slivers, 
+              area = st_area(geometry), 
+              portion_overlap = as.numeric(area/g_area)
+              )
+  if (erase) {
+    # return g1 after erasing all the sliver area. 
+    # this has the effect of creating small holes in the resulting layer
+    # which may cause problems if working with point data. 
+    return(st_erase(g1,slivers[slivers$portion_overlap < portion_overlap,]))
+  } else {
+    # return the polygons that are not slivers
+    return(slivers[slivers$portion_overlap > portion_overlap,])
+  }
+}
+
+geo_not_within_geo <- function(g1,g2, buff = 0){
+  x1 <- st_within(st_buffer(g1,buff),g2)
+  x2 <- map_lgl(x1, function(x) {
+  if (length(x) == 1) {
+    return(TRUE)
+  } else {
+    return(FALSE)
+  }
+  })
+  return(g1[!x2,])
+}
+
+make_plot <- function(g1,g2, name,buff=-1){
+    ggplot() + 
+          # Interpolated geography outline
+          geom_sf(data=g2, size=1.5, fill=NA)  +  
+          # Subgeography units that are not within a single interpolated unit
+          geom_sf(data=geo_not_within_geo(g1, g2, buff), fill="orange", size=.1, alpha = .5) + 
+          # Subgeography outline for all units
+          geom_sf(data=g1, alpha=0, color='red', size=.1) +
+          ggtitle(paste(name," not within a single senate district")) + 
+          theme_minimal()
+}
+```
+# Introduction
+This document has two main sections. First, we create a zip-code to senate district weight matrix and, second, we apply it to CWS data to interpolate senate districts data from the zipcode level. The two parts are nearly self-contained as the main output from the first part is saved in a csv that is accessible in the folder. Unless you are particularly intersted in playing with the geographic data / maps, I recommend reading through part 1 and then doing part 2 interactively.
+
+
+# PART 1
+# Visualizing the problem
+My initial approach tried to make use of geographic analysis packages. The main issue is the boundaries of senate districts are drawn agnostic to where zipcodes are. Small deviations between lines lead to a number of sliver polygons and make it analytically difficult to determine which polygons overlap. I hacked around this, but could not get it perfect as you will see in the maps below. Numerically, these overlaps amount to rounding errors, but a more precise future iteration would use additional geographic data.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Read in shape files. Ideally this would be directly from the internet for easier sharing. 
+# FUTURE: The tigris package does this, but it messes with the projection 
+datum = 'NAD83'
+if (datum == 'wgs84'){
+  senate <- st_read('CTsenate/wgs84/senatect_37800_0000_2010_s100_census_1_shp_wgs84.shp')
+  towns <- st_read('CTtown/wgs84/townct_37800_0000_2010_s100_census_1_shp_wgs84.shp')
+  zip <- st_read('CTZip/WGS84/zipct_37800_0000_2010_s100_census_1_shp_wgs84.shp')
+} else {
+  senate <- st_read('CTsenate/nad83/senatect_37800_0000_2010_s100_census_1_shp_nad83_feet.shp')
+  towns <- st_read('CTtown/nad83/townct_37800_0000_2010_s100_census_1_shp_nad83_feet.shp')
+  zip <- st_read('CTZip/NAD83/zipct_37800_0000_2010_s100_census_1_shp_nad83_feet.shp')
+}
+rm(datum)
+
+# remove water only polygons and simplify tibbles
+senate <- senate %>% arrange(GEOID10) %>% filter(FUNCSTAT10!="F") %>% 
+              select(GEOID10, SLDUST10, NAMELSAD10, geometry)
+
+towns <- towns %>% filter(FUNCSTAT10!="F") %>% select(GEOID10, NAME10, geometry)
+
+zip <- zip %>% select(ZCTA5CE10, GEOID10, geometry)
+```
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+make_plot(towns, senate, "Towns")
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+make_plot(clean_slivers(zip, senate, buff =-1, portion_overlap = 0.04), senate, "zip codes")
+```
+
+Zipcodes and senate districts maps are not built to be overlaid, so there are a number of boundaries
+particularly along the coast that create sliver polygons that represent roughly 3% of the 
+zipcodes area. Clean slivers removes most of these, but notice there's still a zipcode near Sherman (41.6 N, 73.5 W) that falls completely within a senate district, but is treated as if it were in two districts. Inspection of satellite images show that the overlapping area is a body of water.
+
+
+## Interpolation methods
+
+The goal is to interpolate state senate estimates given zipcode and town level data.  I will refer to the units with known data as the subgeography. 
+
+Any interpolation requires assumptions. Most basically we assume variable $X$ is evenly distributed within a subgeography, after conditioning on information $Z$, which could include any covariate known at both the subgeography and interpolation level. For example, if a zipcode contained males and females and was divided between two senate districts that were unisex, we could easily assign $X$ associated with males to the man-senate district. In this analysis, we will not use covariates for conditioning.
+
+When no conditioning information is used, the interpolation simply requires identifying a weighting matrix $W$.
+
+ $$ W * X = \tilde X $$
+where $W$ is $m \times n$ where $m$ is the number of polygons in the interpolated geography and $n$ is the number of polygons in the subgeography. $w_{is}$ represents the fraction of subgeography unit $s$ within interpolated geography unit $i$.
+
+## Area overlap
+The simplest method of interpolatation is weighting based on area overlap. This method assumes all variables are evenly distributed over the given subgeography. Then, weight $w_{is}$ is found by the fraction of the subgeography $s$ that is contained within interpolated geography $i$. This is purely geometeric.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# divides space into distinct polygons that correspond 
+# to a given g1 and g2 (e.g. zipcode and senate district)
+overlap <- function(g1, g2){
+           as_tibble(st_intersection(st_buffer(g1, -1), g2))  %>% 
+               mutate(area = as.double(st_area(geometry)))
+}
+
+# creates the weight matrix (tibble) refered to above
+make_matrix <- function(data, g1_name,g2_name){
+      # g1 = Senate District, g2 = Town or Zip
+      # usage mat <- overlap(g1, g2, buff) %>% make_matrix(g1_name, g2_name)
+        out <- data %>%
+            group_by_(g1_name,g2_name) %>%
+            summarise(area = sum(area)) %>% 
+            mutate(area_ = area) %>% 
+            spread(key=g1_name, value=area_, fill=0) %>% 
+            group_by_(g2_name) %>% 
+            summarise_all(sum)  %>%
+            # without area_ at the end of the matrix, we end up dividing everything by 0
+            mutate(area_ = area) %>% 
+            mutate_if(is.double, funs(round(./area_,2))) %>%
+            select(-area, -area_)
+    return(out)
+   
+}
+
+zip_matrix <- overlap(senate,zip) %>% make_matrix('SLDUST10','ZCTA5CE10')
+write_csv(zip_matrix, "zip_matrix.csv")
+zip_matrix
+```
+# Part 2
+
+## Working with CWS data
+In the previous section, we created the transformation weights matrix. Now we pull in CWS data and use the matrix to interpolate data at the senate district level.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+zip_matrix <- read_csv("zip_matrix.csv")
+
+# My copy of the spss file with cws data.
+# The spss file should have at minimum ctzip and weightct along with survey results data
+YOUR_FILE_PATH <- "~/Documents/Gigs/DataHaven/R Scripts/CWS/Original Data/ALLCASESDH2015_v2 w Indices.sav"
+
+cws <-read_sav(YOUR_FILE_PATH) %>% 
+      mutate(ctzip = paste0("0", as.character(ctzip))) %>% 
+      filter(!is.na(weightct)) 
+
+
+# Function pulls (likert) data from CWS dataset
+get_cws <- function(.data, q, geo=ctzip, zip_rates=FALSE, index=FALSE, rm_refusals=TRUE){
+  
+  q <- deparse(substitute(q))
+  geo <- deparse(substitute(geo))
+  
+  if (rm_refusals & !index) {
+    .data <-  .data[which(.data[[q]] < 8),]
+    warning('assumes values of 8 or higher are associated with non-response')
+    }
+
+  N <- .data %>% group_by_(geo) %>% summarize(n=sum(weightct))
+  
+  P <- .data %>% group_by_(geo, q) %>% summarise(p=sum(weightct)) %>% left_join(N, by = geo) 
+  
+  # RETURN VALUES
+  if (zip_rates) {
+    P %>% mutate(r = p/n) %>% select(-p) %>% spread(key=q, value=r, fill=0)
+  } else if (index) {
+    P["index"] <- P[q]*P["p"]/P["n"] 
+    P %>%  group_by_(geo) %>% summarise(n = mean(n),index = sum(index))
+  } else {
+    P %>% spread(key=q, value=p, fill=0)
+  }
+  }
+```
+```{r,warning=FALSE}
+# example 1
+q5_at_zipcode_level <- cws %>% get_cws(q5)
+q5_at_zipcode_level
+```
+```{r, warning=FALSE}
+# example 2
+rates_q5_at_zipcode_level <- cws %>% get_cws(q5, zip_rates = TRUE)
+rates_q5_at_zipcode_level
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+cws_senate <- function(.data, mat=zip_matrix, rates = FALSE, index = FALSE) {
+  
+  # Ensure sizes match - note we drop a few zipcodes 
+  # roughly 10 observations, because the official zipcodes in tiger gis shapefiles 
+  # do not match the zipcodes in the cws. 
+  
+  ## To avoid conflicts with joins, rename these columns
+  g1 <- names(.data)[1]
+  g2 <- names(mat)[1]
+  
+  geo <- mat[, 1, drop=FALSE] %>% rename_('join_col' = g2 )
+  .data <- .data %>% rename_('join_col'= g1) %>%
+    inner_join(geo, by = 'join_col') %>%
+    arrange(join_col)
+  
+  shared_geo <- .data[ , 1, drop=FALSE]
+  
+  mat <- mat %>% rename_('join_col' = g2 ) %>% inner_join(shared_geo, by='join_col') %>%
+    arrange
+  
+  # prepare matrices 
+  zmat <- t(mat[,-1])
+  .data <- .data[,-1, drop=FALSE]
+  
+  if (index) {
+    .data <- .data %>% mutate(index = n*index)
+  } 
+  
+  interpolated_data <- zmat %*% as.matrix(.data)
+  
+  interpolated_data  <- bind_cols(tibble(district = as_vector(labels(interpolated_data)[1])),
+                                  as_tibble(interpolated_data))
+  # RETURN VALUES
+  if (index) {
+    interpolated_data %>% mutate(index = index / n)
+  } else if (rates) {
+    interpolated_data %>% gather('key', 'values', 3:ncol(.)) %>%
+      mutate(values = values/n) %>% spread('key', 'values')
+  } else {
+    interpolated_data
+  }
+  
+  
+}
+
+```
+
+```{r,warning=FALSE}
+# example 1
+# note when you make rates for likert questions, you want to pass the cws_senate() function
+# data with count data 
+(q1_rates <- (cws %>% get_cws(q1) %>% cws_senate(rates = TRUE)))
+
+# this code returns garbage:
+# cws %>% get_cws(q1, zip_rates=TRUE) %>% cws_senate(rates = TRUE) 
+```
+```{r, warning=FALSE}
+# attach to geo data
+q1_geom <- left_join(q1_rates, senate, by=c("district" = "SLDUST10")) %>% rename('yes' = '1')
+ggplot() + geom_sf(data=q1_geom, aes(fill=yes)) + ggtitle("People reporting satisfaction with life by State Senate District")
+```
+
+
+
+```{r, warning=FALSE}
+# example 2
+(finsec <- cws %>% get_cws(FINSEC_POP, index=TRUE) %>% cws_senate(index=TRUE))
+```
+```{r, warning=FALSE}
+# attach to geo data
+finsec <- left_join(finsec, senate, by=c("district" = "SLDUST10"))
+ggplot() + geom_sf(data=finsec, aes(fill=index)) + ggtitle("Financial Security Index by State Senate District")
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# q1 
+o<-cws %>% get_cws(q1) %>% cws_senate(rates=TRUE) %>% select(district, q1_satisfied_with_place = "1")
+
+# Financial Security Index
+d<-cws %>% get_cws(FINSEC_POP, index=TRUE) %>% cws_senate(index=TRUE) %>% select(district, financial_security_index = index) 
+o <- left_join(o, d, by="district")
+
+# Personal Wellbeing Index
+d<-cws %>% get_cws(PERSWELL_POP2, index=TRUE) %>% cws_senate(index=TRUE) %>% select(district, personal_wellbeing_index = index) 
+o <- left_join(o, d, by="district")
+
+# Neighborhood Walkability Index
+d<-cws %>% get_cws(NeighborhoodWalkability_POP, index=TRUE) %>% cws_senate(index=TRUE) %>% select(district, walkability_index = index) 
+o <- left_join(o, d, by="district")
+
+# Quality of Society Index
+d<-cws %>% get_cws(QUALofSOC_POP, index=TRUE) %>% cws_senate(index=TRUE) %>% select(district, quality_of_society_index = index) 
+o <- left_join(o, d, by="district")
+
+# Smokes
+smokers <- cws %>% get_cws(q40) %>% cws_senate() %>% mutate(smokers = `1`+`2`) %>% select(district,smokers)
+d<-cws %>% get_cws(q39) %>% cws_senate() %>% left_join(smokers, by="district") %>% mutate(smoking_rate=smokers/n) %>% select(district, smoking_rate)
+o <- left_join(o, d, by="district")
+
+# Obesity Rate
+d<- cws %>% get_cws(bmir) %>% cws_senate(rate=TRUE) %>% select(district, obesity=`4`)
+o <- left_join(o, d, by="district")
+
+
+# Unemployment
+d<-cws %>% get_cws(q47) %>% cws_senate(rate=TRUE) %>% select(district, unemployed = `2`) 
+o <- left_join(o, d, by="district")
+
+# Underemployed
+unemploy <-cws %>% get_cws(q47) %>% cws_senate() %>% select(district, n, unemployed = `2`) 
+d <- cws %>% get_cws(q50) %>% cws_senate(rate=TRUE) %>% mutate(want_to_work = n*`2`) %>%
+         select(district, want_to_work) %>% left_join(unemploy, by="district") %>%
+         mutate(underemployed = (want_to_work + unemployed)/n) %>% select(district, underemployed)
+o <- left_join(o, d, by="district")
+
+write_csv(o, "Community_Wellbeing.csv")
+```
+
+
+
+
+
+
