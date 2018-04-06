@@ -4,7 +4,12 @@
 2) R files
 3) Dependencies
 
-I recommend starting with overlap.pdf and then overlap.Rmd.
+I recommend starting with [overlap.pdf](https://github.com/anisfeld/Overlap/blob/master/overlap.pdf) and then exploring the code in [overlap.Rmd](https://github.com/anisfeld/Overlap/blob/master/overlap.Rmd)
+
+DataHaven, a Connecticut-based non-profit data consultancy, conducts the Community Wellbeing Survey every three years to provide more holistic metrics to inform decisionmaking. The purpose of Overlap is to interpolate survey data collected at the zip-code level to state senate districts so that our clients can use Community Wellbeing Survey data to drive approach to advocating for reforms.
+
+The document has two sections. First, we create a zip-code to senate district weight matrix and, second, we apply it to CWS data to interpolate senate districts data from the zipcode level. The two parts are nearly self-contained as the main output from the first part is saved in a csv that is accessible in the folder. Unless you are particularly intersted in playing with the geographic data / maps, I recommend reading through part 1 and then doing part 2 interactively.
+
 
 ## Data
 1) GIS files - (in folders CT*) sourced from the census bureau
